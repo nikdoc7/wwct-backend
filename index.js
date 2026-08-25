@@ -1,0 +1,144 @@
+// Backend proxy for "What We Cooking Today".
+// Keeps the Anthropic API key server-side and enforces strict recipe rules
+// so the AI can't be looser than the local demo fallback was.
+//
+// Setup:
+//   npm install
+//   cp .env.example .env   (put your real ANTHROPIC_API_KEY in .env)
+//   npm start
+//
+// Then in the app, set API_BASE_URL (in the <script> near the top of
+// WhatWeCookingToday.html) to wherever you deploy this.
+
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+
+const API_KEY = process.env.ANTHROPIC_API_KEY;
+const MODEL = 'claude-sonnet-4-6';
+
+async function callClaude(messages, maxTokens, system) {
+  const body = { model: MODEL, max_tokens: maxTokens, messages };
+  if (system) body.system = system;
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': API_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    const text = await res.text();
+    throw new Error(`Anthropic API error ${res.status}: ${text}`);
+  }
+  const data = await res.json();
+  const block = (data.content || []).find(b => b.type === 'text');
+  if (!block) throw new Error('Empty response from model');
+  return block.text.replace(/```json|```/g, '').trim();
+}
+
+const LANG_NAMES = { el: 'Greek', en: 'English', es: 'Spanish', de: 'German', fr: 'French', it: 'Italian' };
+
+// ============================================================
+// POST /api/identify  { image: base64, mediaType: 'image/jpeg' }
+// -> [{ name, category, quantity, unit }]
+// ============================================================
+app.post('/api/identify', async (req, res) => {
+  try {
+    const { image, mediaType } = req.body;
+    if (!image) return res.status(400).json({ error: 'missing image' });
+
+    const text = await callClaude([{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType || 'image/jpeg', data: image } },
+        { type: 'text', text: `Look at this photo (fridge, pantry, or food items). Identify only the distinct food items you can clearly see — do not guess at items that are ambiguous or out of frame.
+Reply with ONLY a JSON array, no prose, no markdown. Each item: {"name": "...", "category": "fridge" | "freezer" | "pantry", "quantity": "optional number as string or null", "unit": "optional unit or null"}.
+If nothing is clearly identifiable, return [].` }
+      ]
+    }], 700);
+
+    let parsed = [];
+    try { parsed = JSON.parse(text); } catch (e) { parsed = []; }
+    res.json(Array.isArray(parsed) ? parsed : []);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'identify failed' });
+  }
+});
+
+// ============================================================
+// POST /api/recipes  { ingredients, filters, lang }
+// -> [{ title, time_minutes, difficulty, meal_type, uses, extra_needed,
+//        instructions, calories, protein, carbs, fat, is_local, diets }]
+// ============================================================
+app.post('/api/recipes', async (req, res) => {
+  try {
+    const { ingredients, filters = {}, lang = 'en' } = req.body;
+    if (!Array.isArray(ingredients) || !ingredients.length) {
+      return res.status(400).json({ error: 'missing ingredients' });
+    }
+    const langName = LANG_NAMES[lang] || 'English';
+
+    const ingredientLines = ingredients.map(i => {
+      const bits = [i.name];
+      if (i.quantity) bits.push(`(${i.quantity}${i.unit ? ' ' + i.unit : ''})`);
+      if (i.urgent) bits.push('[expiring soon — prioritize this]');
+      if (i.isLeftover) bits.push('[leftover from a previous meal]');
+      return '- ' + bits.join(' ');
+    }).join('\n');
+
+    const filterLines = [];
+    if (filters.meal) filterLines.push(`Meal type requested: ${filters.meal} (only return this meal type).`);
+    if (filters.time) filterLines.push(`Max time: ${filters.time} minutes per recipe.`);
+    if (filters.diff) filterLines.push(`Difficulty requested: ${filters.diff}.`);
+    const diets = filters.diets && filters.diets.length ? filters.diets : (filters.diet ? [filters.diet] : []);
+    if (diets.length) filterLines.push(`Dietary requirement (must genuinely satisfy, not just label): ${diets.join(', ')}.`);
+    if (filters.preferLocal) filterLines.push('Prefer traditional/local-style recipes where it fits the ingredients.');
+    if (filters.preferUrgent) filterLines.push('Strongly prioritize the ingredients marked as expiring soon.');
+
+    const system = `You are a careful home-cooking assistant. You generate recipes strictly from the ingredients the user actually has (plus common staples: salt, pepper, oil, water). You write in ${langName}.
+
+HARD RULES — never break these:
+1. Every recipe must be something a competent home cook could actually make and eat. No invented combinations that don't make culinary sense (e.g. never suggest baking or sweetening ingredients that are clearly savory-only, like onion+garlic+meat, into a "dessert").
+2. DESSERT RULE (strict): only produce a recipe with meal_type "dessert" if the available ingredients genuinely support making something sweet — i.e. at least one clearly sweet ingredient (fruit, honey, sugar, chocolate, jam, etc.) OR at least two baking-base ingredients together (e.g. flour+egg, or butter+sugar). If the ingredient list is entirely savory (vegetables, meat, fish, rice, pasta, cheese, alliums) with nothing sweet-compatible, DO NOT include a dessert at all — simply return fewer recipes covering only the meal types that make sense. Never force a dessert into the output just to fill a slot.
+3. Diet tags in "diets" must be factually true for the exact recipe you wrote, not assumed: 
+   - "vegan" only if there is no meat, fish, dairy, egg, or honey in the recipe.
+   - "vegetarian" only if there is no meat or fish.
+   - "lactose-free" only if there is no milk, cheese, butter, cream, or yogurt.
+   - "gluten-free" only if there is no wheat flour, pasta, bread, or similar gluten-containing ingredient.
+   - "high-protein" only if protein is genuinely high for the dish (roughly 15g+ per serving).
+   - "low-cal" only if calories are genuinely modest (roughly under 400 kcal per serving).
+   If a diet filter was requested and the ingredients cannot honestly satisfy it, adapt the recipe (e.g. suggest a dairy-free substitution) rather than mislabeling it — and only claim the tag if the adapted version truly satisfies it.
+4. Use realistic, non-invented calorie/macro estimates — round numbers, no false precision.
+5. "uses" must only list ingredients that were actually given to you. "extra_needed" is for anything genuinely missing that isn't a basic staple (salt, pepper, oil, water don't need to be listed).
+6. If the given ingredients genuinely cannot make a sensible recipe of a requested type, return fewer recipes rather than inventing something implausible. Never sacrifice culinary or dietary honesty to hit a target recipe count.
+7. Output ONLY a JSON array, no markdown fences, no prose before or after. Each element:
+{"title": string, "time_minutes": number, "difficulty": "easy"|"medium"|"hard", "meal_type": "breakfast"|"lunch"|"dinner"|"snack"|"dessert", "uses": string[], "extra_needed": string[], "instructions": string[], "calories": number, "protein": number, "carbs": number, "fat": number, "is_local": boolean, "diets": string[]}`;
+
+    const userMsg = `Available ingredients:
+${ingredientLines}
+
+${filterLines.length ? 'Filters:\n' + filterLines.join('\n') : 'No specific filters — aim for a variety: one snack, one lunch, one dinner, and a dessert ONLY if rule 2 allows it.'}
+
+Return 2-4 recipes as a JSON array following the schema exactly.`;
+
+    const text = await callClaude([{ role: 'user', content: userMsg }], 2200, system);
+
+    let parsed = [];
+    try { parsed = JSON.parse(text); } catch (e) { parsed = []; }
+    res.json(Array.isArray(parsed) ? parsed : []);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'recipes failed' });
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`WWCT backend running on port ${PORT}`));
