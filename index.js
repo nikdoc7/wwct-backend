@@ -40,7 +40,31 @@ async function callClaude(messages, maxTokens, system) {
   const data = await res.json();
   const block = (data.content || []).find(b => b.type === 'text');
   if (!block) throw new Error('Empty response from model');
-  return block.text.replace(/```json|```/g, '').trim();
+  return block.text.trim();
+}
+
+// Claude is instructed to return ONLY JSON, but real-world responses can
+// occasionally include a code fence or a short lead-in sentence despite
+// that instruction. Rather than silently swallowing a parse failure and
+// returning an empty array (which the app displays as "nothing found" —
+// indistinguishable from a genuine empty result), extract the JSON
+// substring robustly and only give up after that also fails, so a real
+// parsing problem surfaces as an actual error the app can report.
+function extractJson(raw, kind /* 'array' | 'object' */) {
+  let text = raw.replace(/```json/gi, '').replace(/```/g, '').trim();
+  try {
+    return JSON.parse(text);
+  } catch (e) { /* fall through to bracket extraction */ }
+
+  const openChar = kind === 'array' ? '[' : '{';
+  const closeChar = kind === 'array' ? ']' : '}';
+  const start = text.indexOf(openChar);
+  const end = text.lastIndexOf(closeChar);
+  if (start === -1 || end === -1 || end < start) {
+    throw new Error(`No ${kind} found in model response: ${text.slice(0, 300)}`);
+  }
+  const candidate = text.slice(start, end + 1);
+  return JSON.parse(candidate); // let this throw if still invalid — caller handles it
 }
 
 const LANG_NAMES = { el: 'Greek', en: 'English', es: 'Spanish', de: 'German', fr: 'French', it: 'Italian' };
@@ -64,12 +88,17 @@ If nothing is clearly identifiable, return [].` }
       ]
     }], 700);
 
-    let parsed = [];
-    try { parsed = JSON.parse(text); } catch (e) { parsed = []; }
+    let parsed;
+    try {
+      parsed = extractJson(text, 'array');
+    } catch (parseErr) {
+      console.error('[identify] JSON parse failed. Raw model output:', text);
+      throw parseErr;
+    }
     res.json(Array.isArray(parsed) ? parsed : []);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'identify failed' });
+    console.error('[identify] failed:', err.message);
+    res.status(500).json({ error: 'identify failed', detail: err.message });
   }
 });
 
@@ -108,7 +137,7 @@ app.post('/api/recipes', async (req, res) => {
 HARD RULES — never break these:
 1. Every recipe must be something a competent home cook could actually make and eat. No invented combinations that don't make culinary sense (e.g. never suggest baking or sweetening ingredients that are clearly savory-only, like onion+garlic+meat, into a "dessert").
 2. DESSERT RULE (strict): only produce a recipe with meal_type "dessert" if the available ingredients genuinely support making something sweet — i.e. at least one clearly sweet ingredient (fruit, honey, sugar, chocolate, jam, etc.) OR at least two baking-base ingredients together (e.g. flour+egg, or butter+sugar). If the ingredient list is entirely savory (vegetables, meat, fish, rice, pasta, cheese, alliums) with nothing sweet-compatible, DO NOT include a dessert at all — simply return fewer recipes covering only the meal types that make sense. Never force a dessert into the output just to fill a slot.
-3. Diet tags in "diets" must be factually true for the exact recipe you wrote, not assumed: 
+3. Diet tags in "diets" must be factually true for the exact recipe you wrote, not assumed:
    - "vegan" only if there is no meat, fish, dairy, egg, or honey in the recipe.
    - "vegetarian" only if there is no meat or fish.
    - "lactose-free" only if there is no milk, cheese, butter, cream, or yogurt.
@@ -118,8 +147,8 @@ HARD RULES — never break these:
    If a diet filter was requested and the ingredients cannot honestly satisfy it, adapt the recipe (e.g. suggest a dairy-free substitution) rather than mislabeling it — and only claim the tag if the adapted version truly satisfies it.
 4. Use realistic, non-invented calorie/macro estimates — round numbers, no false precision.
 5. "uses" must only list ingredients that were actually given to you. "extra_needed" is for anything genuinely missing that isn't a basic staple (salt, pepper, oil, water don't need to be listed).
-6. If the given ingredients genuinely cannot make a sensible recipe of a requested type, return fewer recipes rather than inventing something implausible. Never sacrifice culinary or dietary honesty to hit a target recipe count.
-7. Output ONLY a JSON array, no markdown fences, no prose before or after. Each element:
+6. Even with a fairly ordinary, savory-only ingredient list, you should almost always be able to produce at least 1-2 sensible everyday recipes (e.g. a simple sandwich, salad, pita, stir-fry, pasta, or grain bowl) — reserve returning zero recipes for genuinely unworkable or near-empty ingredient lists. Never sacrifice culinary or dietary honesty to hit a target count, but do not be overly conservative either.
+7. Respond with EXACTLY one JSON array and nothing else: no markdown code fences, no leading sentence like "Here are the recipes", no trailing commentary, no explanation of your reasoning. The very first character of your reply must be "[" and the very last character must be "]". Each element:
 {"title": string, "time_minutes": number, "difficulty": "easy"|"medium"|"hard", "meal_type": "breakfast"|"lunch"|"dinner"|"snack"|"dessert", "uses": string[], "extra_needed": string[], "instructions": string[], "calories": number, "protein": number, "carbs": number, "fat": number, "is_local": boolean, "diets": string[]}`;
 
     const userMsg = `Available ingredients:
@@ -131,14 +160,21 @@ Return 2-4 recipes as a JSON array following the schema exactly.`;
 
     const text = await callClaude([{ role: 'user', content: userMsg }], 2200, system);
 
-    let parsed = [];
-    try { parsed = JSON.parse(text); } catch (e) { parsed = []; }
+    let parsed;
+    try {
+      parsed = extractJson(text, 'array');
+    } catch (parseErr) {
+      console.error('[recipes] JSON parse failed. Raw model output:', text);
+      throw parseErr;
+    }
     res.json(Array.isArray(parsed) ? parsed : []);
   } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: 'recipes failed' });
+    console.error('[recipes] failed:', err.message);
+    res.status(500).json({ error: 'recipes failed', detail: err.message });
   }
 });
+
+app.get('/health', (req, res) => res.json({ ok: true, hasKey: !!API_KEY }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`WWCT backend running on port ${PORT}`));
