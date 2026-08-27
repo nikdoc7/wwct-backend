@@ -68,6 +68,91 @@ function extractJson(raw, kind /* 'array' | 'object' */) {
 }
 
 const LANG_NAMES = { el: 'Greek', en: 'English', es: 'Spanish', de: 'German', fr: 'French', it: 'Italian' };
+const CUISINE_NAMES = { el: 'Greek', en: 'British/American', es: 'Spanish', de: 'German', fr: 'French', it: 'Italian' };
+
+// ============================================================
+// POST /api/barcode  { code }
+// -> { name, category } | { notFound: true }
+// ============================================================
+// Tries several free, key-less databases in turn. Open Food Facts covers
+// groceries well but only food; its sibling databases (Products, Beauty)
+// use the same engine and cover household and personal-care items, and
+// UPCItemDB's trial tier catches general retail that none of them index.
+// All are queried server-side so the app isn't subject to per-site CORS
+// rules, and so sources can be added later without shipping a new build.
+const OFF_FAMILY = [
+  { host: 'world.openfoodfacts.org', defaultCategory: 'pantry' },
+  { host: 'world.openproductsfacts.org', defaultCategory: 'pantry' },
+  { host: 'world.openbeautyfacts.org', defaultCategory: 'pantry' }
+];
+
+function categoryFromTags(tags, fallback) {
+  const s = (tags || []).join(' ').toLowerCase();
+  if (/frozen|surgel|tiefkühl|congel/.test(s)) return 'freezer';
+  if (/dairy|milk|yogurt|yoghurt|cheese|butter|cream|egg|fresh|charcuterie|meat|fish|seafood/.test(s)) return 'fridge';
+  return fallback || 'pantry';
+}
+
+async function lookupOffFamily(code) {
+  for (const src of OFF_FAMILY) {
+    try {
+      const url = `https://${src.host}/api/v2/product/${encodeURIComponent(code)}.json?fields=product_name,product_name_en,brands,categories_tags`;
+      const r = await fetch(url, { headers: { 'User-Agent': 'WhatWeCookingToday/1.0 (contact via app)' } });
+      if (!r.ok) continue;
+      const data = await r.json();
+      if (data.status !== 1 || !data.product) continue;
+      const p = data.product;
+      const name = p.product_name_en || p.product_name;
+      if (!name || !String(name).trim()) continue;
+      const brand = (p.brands || '').split(',')[0].trim();
+      return {
+        name: brand && !name.toLowerCase().includes(brand.toLowerCase()) ? `${brand} ${name}` : name,
+        category: categoryFromTags(p.categories_tags, src.defaultCategory),
+        source: src.host
+      };
+    } catch (e) {
+      console.warn('[barcode] source failed', src.host, e.message);
+    }
+  }
+  return null;
+}
+
+async function lookupUpcItemDb(code) {
+  try {
+    // Trial tier: no key, but only ~100 lookups/day per IP — used strictly
+    // as a last resort after the open databases come up empty.
+    const r = await fetch(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
+    if (!r.ok) return null;
+    const data = await r.json();
+    const item = data && Array.isArray(data.items) ? data.items[0] : null;
+    if (!item || !item.title) return null;
+    return {
+      name: item.title,
+      category: categoryFromTags([item.category || ''], 'pantry'),
+      source: 'upcitemdb'
+    };
+  } catch (e) {
+    console.warn('[barcode] upcitemdb failed', e.message);
+    return null;
+  }
+}
+
+app.post('/api/barcode', async (req, res) => {
+  try {
+    const code = (req.body && req.body.code ? String(req.body.code) : '').trim();
+    if (!code) return res.status(400).json({ error: 'missing code' });
+
+    let product = await lookupOffFamily(code);
+    if (!product) product = await lookupUpcItemDb(code);
+
+    if (!product) return res.json({ notFound: true });
+    res.json(product);
+  } catch (err) {
+    console.error('[barcode] failed:', err.message);
+    res.status(500).json({ error: 'barcode lookup failed', detail: err.message });
+  }
+});
+
 
 // ============================================================
 // POST /api/identify  { image: base64, mediaType: 'image/jpeg' }
@@ -114,6 +199,7 @@ app.post('/api/recipes', async (req, res) => {
       return res.status(400).json({ error: 'missing ingredients' });
     }
     const langName = LANG_NAMES[lang] || 'English';
+    const cuisine = CUISINE_NAMES[lang] || 'Mediterranean';
 
     const ingredientLines = ingredients.map(i => {
       const bits = [i.name];
@@ -129,7 +215,9 @@ app.post('/api/recipes', async (req, res) => {
     if (filters.diff) filterLines.push(`Difficulty requested: ${filters.diff}.`);
     const diets = filters.diets && filters.diets.length ? filters.diets : (filters.diet ? [filters.diet] : []);
     if (diets.length) filterLines.push(`Dietary requirement (must genuinely satisfy, not just label): ${diets.join(', ')}.`);
-    if (filters.preferLocal) filterLines.push('Prefer traditional/local-style recipes where it fits the ingredients.');
+    if (filters.preferLocal) {
+      filterLines.push(`Prefer ${cuisine} cooking. First choice is a genuine traditional ${cuisine} dish these ingredients can actually make. If no authentic traditional dish fits, do NOT fall back to generic international recipes — instead stay within ${cuisine} home cooking: use its everyday techniques, flavour pairings and staples (for Greek: olive oil, lemon, oregano, garlic, tomato, feta, yogurt, dill, parsley) to build a dish that would be recognisable in a ${cuisine} kitchen. Only set "is_local": true for genuinely traditional named dishes; a ${cuisine}-style dish that isn't a classic should have "is_local": false but should still be clearly ${cuisine} in character.`);
+    }
     if (filters.preferUrgent) filterLines.push('Strongly prioritize the ingredients marked as expiring soon.');
 
     const system = `You are a careful home-cooking assistant. You generate recipes strictly from the ingredients the user actually has (plus common staples: salt, pepper, oil, water). You write in ${langName}.
